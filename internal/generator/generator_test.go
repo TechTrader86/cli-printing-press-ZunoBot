@@ -6326,6 +6326,71 @@ func TestGenerate_CookieAuthUsesBrowserTemplate(t *testing.T) {
 	runGoCommand(t, outputDir, "build", "./...")
 }
 
+// TestGenerate_CookieAuthWindowsCompatibility asserts the cookie-auth template
+// emits a portable Python resolver and a Windows-aware fallback for the
+// `auth login --chrome` flow. Regression for issue #1101: hardcoded `python3`
+// and a non-Windows-friendly install hint made every cookie-auth CLI unusable
+// on Windows.
+func TestGenerate_CookieAuthWindowsCompatibility(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := &spec.APISpec{
+		Name:    "winapp",
+		Version: "0.1.0",
+		BaseURL: "https://app.example.com",
+		Auth: spec.AuthConfig{
+			Type:         "cookie",
+			Header:       "Cookie",
+			In:           "cookie",
+			CookieDomain: ".example.com",
+			EnvVars:      []string{"WINAPP_COOKIES"},
+		},
+		Config: spec.ConfigSpec{
+			Format: "toml",
+			Path:   "~/.config/winapp-pp-cli/config.toml",
+		},
+		Resources: map[string]spec.Resource{
+			"items": {
+				Description: "Manage items",
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/api/items", Description: "List items"},
+				},
+			},
+		},
+	}
+
+	outputDir := filepath.Join(t.TempDir(), "winapp-pp-cli")
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	auth, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "auth.go"))
+	require.NoError(t, err)
+	content := string(auth)
+
+	// Python resolver tries all three common binary names rather than only `python3`.
+	// Match the struct-literal needles so `"python"` isn't vacuously satisfied as
+	// a substring of `"python3"`.
+	assert.Contains(t, content, "resolvePythonBinary")
+	assert.Contains(t, content, `{"python3", nil}`)
+	assert.Contains(t, content, `{"python", nil}`)
+	assert.Contains(t, content, `{"py", []string{"-3"}}`)
+
+	// pycookiecheat is skipped on Windows because it raises OSError there.
+	assert.Contains(t, content, `runtime.GOOS != "windows"`)
+	assert.Contains(t, content, "pycookiecheat does not support Windows")
+
+	// The resolved (bin, args) pair is carried on cookieTool so detection and
+	// extraction cannot disagree about which interpreter to invoke.
+	assert.Contains(t, content, "type cookieTool struct")
+	assert.Contains(t, content, "pyBin")
+	assert.Contains(t, content, "pyArgs")
+	assert.NotContains(t, content, `exec.Command("python3", "-c", script)`)
+	assert.Contains(t, content, `exec.Command(tool.pyBin,`)
+
+	// Windows users get a workable next step instead of the Unix install hint.
+	assert.Contains(t, content, "auth login --browser")
+	assert.Contains(t, content, "cookie-scoop-cli")
+}
+
 func TestGenerate_UserAgentOverrideGatedByBrowserTransport(t *testing.T) {
 	t.Parallel()
 
