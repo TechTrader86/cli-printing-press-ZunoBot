@@ -2556,6 +2556,11 @@ RunE: func(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("query: %w", err)
 	}
 	defer rows.Close()
+	// Scan each row. id/data on the resources table are NOT NULL so bare
+	// strings are safe; ANY optional field selected via json_extract or
+	// pulled from a typed FTS/upsert table can be NULL — use sql.Null*
+	// scan targets (or COALESCE in the SQL) for those, see the NULL-safe
+	// scans paragraph below.
 	var results []yourRowType // scan rows into the slice
 	if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !humanFriendly) {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -2574,6 +2579,25 @@ For features that combine both (cache an API response in the store, or fall thro
 **Shared helpers available to novel code:** The generator emits `internal/cliutil/` in every CLI. When authoring novel commands, prefer `cliutil.FanoutRun` for any aggregation command (any `--site`/`--source`/`--region` CSV fan-out) and `cliutil.CleanText` for any text extracted from HTML or schema.org JSON-LD. Re-implementing these inline is how recipe-goat's trending silent-drop and `&#39;` entity bugs shipped.
 
 **Streaming frame normalizers MUST use `cliutil.ExtractNumber` / `cliutil.ExtractInt` rather than raw `float64`/`int64` struct fields.** Real-world WebSocket and streaming JSON feeds (Binance, Coinbase, Kraken, Stripe `*_decimal`, vendor-specific market-data feeds) commonly encode numeric values as JSON-encoded strings (`"price":"1.91"`). `json.Unmarshal` of a JSON string into a `float64` field returns no error and silently leaves the field at 0; combined with NULL-on-zero patterns this discards the entire numeric feed with no error signal anywhere in the pipeline. The helpers accept both shapes (JSON number or JSON-encoded string), report `ok=false` on missing/null/unparseable, and are the canonical extraction path for `map[string]json.RawMessage` decoders. Re-implementing this inline as a `float64` struct field is the silent-aggregation-failure bug class.
+
+**NULL-safe SQL scans MUST use `sql.Null*` scan targets (or `COALESCE(<col>, <zero>)` in the query) for any column that can be NULL.** SQLite returns NULL for any absent JSON field selected via `json_extract(data, '$.optional_field')`, for any nullable column in a typed FTS/upsert table the generator emits, and for any field the API omits from a particular response. `database/sql`'s `rows.Scan` into a bare `string`/`int64`/`float64` returns a non-nil error on NULL (`Scan error on column index N: converting NULL to string is unsupported`) — and the surrounding `for rows.Next()` loop typically `continue`s on scan error, silently dropping every row. The result: queries return zero records, no error reaches the caller, the feature looks healthy because the API call succeeded. Use `var v sql.NullString` (or `NullInt64` / `NullFloat64` / `NullTime`) as the scan target and copy `.String` / `.Int64` / `.Float64` / `.Time` into your row struct, accepting the zero value as the missing-field representation. Re-implementing this inline as bare-string scans is the silent-row-drop bug class.
+
+```go
+// Wrong — every NULL column kills the row.
+var name string
+if err := rows.Scan(&id, &name); err != nil { continue }
+
+// Right — NULL becomes the zero value, no row is lost.
+var name sql.NullString
+if err := rows.Scan(&id, &name); err != nil { continue }
+result.Name = name.String
+```
+
+Also right: push the default into the query so the scan target stays bare.
+
+```sql
+SELECT id, COALESCE(json_extract(data, '$.name'), '') FROM resources WHERE ...
+```
 
 **Typed exit-code verification:** If a novel command intentionally returns a non-zero code for a non-error control-flow result, add `cmd.Annotations["pp:typed-exit-codes"] = "0,<code>"` (or the equivalent `Annotations: map[string]string{...}` literal) and document the same command-specific codes in its help. Do not list the global failure palette in command help unless those exits should count as a verify pass for that command; keep general exit-code troubleshooting in README/SKILL prose.
 
