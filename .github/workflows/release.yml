@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  go-floor:
+    name: go-floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Enforce Go floor against printing-press-library
+        env:
+          GO_FLOOR_ENFORCE_LIBRARY: "1"
+        run: python3 scripts/verify-go-floor.py
+
+  release-please:
+    needs: go-floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          # Fall back to GITHUB_TOKEN when RELEASE_PLEASE_TOKEN is unset.
+          # The default GITHUB_TOKEN cannot trigger workflows, so release PRs
+          # opened with it skip CI and bypass tripwires like
+          # TestModulePathMatchesMajorVersion. A PAT or App token in
+          # RELEASE_PLEASE_TOKEN restores normal pull_request triggers.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  goreleaser:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: sigstore/cosign-installer@v4.1.0
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean --parallelism=1 --timeout=35m
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOMAXPROCS: "2"
+
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | select(.size > 0) | .name')
+          for os in linux darwin windows; do
+            extension=tar.gz
+            if [ "$os" = windows ]; then extension=zip; fi
+            for arch in amd64 arm64; do
+              expected="cli-printing-press_${os}_${arch}.${extension}"
+              if ! printf '%s\n' "$assets" | grep -Fxq "$expected"; then
+                echo "::error::Release $RELEASE_TAG is missing non-empty asset $expected"
+                exit 1
+              fi
+            done
+          done
+          printf '%s\n' "$assets" | grep -Fx checksums.txt
